@@ -1,0 +1,203 @@
+name: Sync Upstream
+
+# 每周检测上游 MengMengCode/VoCat 是否有更新：
+#   - 无更新：直接退出
+#   - 有更新：同步上游，但保护清单内的文件一律保留本地版本
+#   - 迁移编号冲突：自动顺延本地迁移编号
+#   - 编译失败：创建 Issue 通知，不自动部署
+on:
+  schedule:
+    # 每周一 03:00 UTC（北京时间 11:00）
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: MengMengCode/VoCat
+  UPSTREAM_BRANCH: master
+
+  # 保护清单：这些文件永不采用上游版本，保持本地改动
+  PROTECTED_FILES: |
+    internal/store/models.go
+    internal/store/migrations.go
+    internal/store/store.go
+    internal/store/automatic_tasks.go
+    internal/store/sms.go
+    internal/server/automatic_tasks.go
+    internal/update/github.go
+    internal/update/update.go
+    cmd/vocat/cli.go
+    web/src/pages/AutomaticTasksPage.tsx
+    web/package.json
+    web/package-lock.json
+    web/postcss.config.js
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}" || {
+            echo "::error::拉取上游失败"
+            exit 1
+          }
+          BEHIND=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "上游领先本地 ${BEHIND} 个提交"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "上游无更新，跳过。"
+          else
+            echo "=== 上游新增提交 ==="
+            git log --oneline "HEAD..upstream/${UPSTREAM_BRANCH}" | head -30
+          fi
+
+      - name: Check migration numbering conflict
+        id: migrations
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          UPSTREAM_MAX=$(git show "upstream/${UPSTREAM_BRANCH}:internal/store/migrations.go" \
+            | grep -oP 'case\s+\K[0-9]+' | sort -n | tail -1 || echo 0)
+          LOCAL_CASE=$(grep -oP 'case\s+\K[0-9]+' internal/store/migrations.go | sort -n | tail -1)
+          echo "上游最大迁移编号: ${UPSTREAM_MAX}"
+          echo "本地最大迁移编号: ${LOCAL_CASE}"
+          echo "upstream_max=${UPSTREAM_MAX}" >> "$GITHUB_OUTPUT"
+          if [ "$UPSTREAM_MAX" -ge "$LOCAL_CASE" ]; then
+            NEW_CASE=$((UPSTREAM_MAX + 1))
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "new_case=${NEW_CASE}" >> "$GITHUB_OUTPUT"
+            echo "::warning::迁移编号冲突：本地 case ${LOCAL_CASE} 将顺延为 case ${NEW_CASE}"
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream (keeping protected files)
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          # 用 ours 策略合并：冲突时保留本地版本
+          git merge "upstream/${UPSTREAM_BRANCH}" \
+            -m "chore: sync upstream ${UPSTREAM_REPO}@$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")" \
+            -X ours --no-edit || true
+
+          # 保护清单内的文件强制回退到本地版本（合并前的 HEAD）
+          SKIPPED=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            UPSTREAM_CHANGED=$(git diff --quiet "HEAD~1" "upstream/${UPSTREAM_BRANCH}" -- "$f" 2>/dev/null && echo no || echo yes)
+            if [ "$UPSTREAM_CHANGED" = "yes" ]; then
+              git checkout "HEAD~1" -- "$f" 2>/dev/null || true
+              COMMITS=$(git rev-list --count "HEAD~1..upstream/${UPSTREAM_BRANCH}" -- "$f" 2>/dev/null || echo "?")
+              SKIPPED="${SKIPPED}\n  - ${f} （上游 ${COMMITS} 个提交被跳过）"
+            fi
+          done <<< "$PROTECTED_FILES"
+
+          if [ -n "$SKIPPED" ]; then
+            echo "::notice::以下文件上游有更新，但因保护清单未覆盖：${SKIPPED}"
+            printf '%s\n' "$SKIPPED" > /tmp/skipped.txt
+          fi
+
+      - name: Renumber local migration if conflict
+        if: steps.migrations.outputs.conflict == 'true'
+        run: |
+          set -euo pipefail
+          OLD=$(grep -oP 'case\s+\K[0-9]+' internal/store/migrations.go | sort -n | tail -1)
+          NEW=${{ steps.migrations.outputs.new_case }}
+          echo "迁移编号 ${OLD} -> ${NEW}"
+          sed -i "s/^\(\s*\)case ${OLD}:$/\1case ${NEW}:/" internal/store/migrations.go
+          sed -i "s/^const schemaVersion = ${OLD}$/const schemaVersion = ${NEW}/" internal/store/store.go
+          grep -n "case ${NEW}:" internal/store/migrations.go || { echo "::error::编号顺延失败"; exit 1; }
+          grep -n "const schemaVersion = ${NEW}" internal/store/store.go || { echo "::error::schemaVersion 顺延失败"; exit 1; }
+
+      - name: Set up Go
+        if: steps.fetch.outputs.behind != '0'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node
+        if: steps.fetch.outputs.behind != '0'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        id: web
+        if: steps.fetch.outputs.behind != '0'
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Build binaries
+        id: build
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in "linux amd64" "linux arm64" "linux arm"; do
+            set -- $target
+            GOOS=$1 GOARCH=$2 CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w" -o "dist/vocat-$1-$2" ./cmd/vocat
+          done
+          ls -la dist/
+
+      - name: Create issue on build failure
+        if: failure() && steps.fetch.outputs.behind != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const skipped = require('fs').existsSync('/tmp/skipped.txt')
+              ? require('fs').readFileSync('/tmp/skipped.txt', 'utf8')
+              : '(无)';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `上游同步失败：${new Date().toISOString().slice(0,10)}`,
+              body: [
+                '## 每周上游同步失败',
+                '',
+                `运行记录：${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                '',
+                '### 因保护清单被跳过的上游改动',
+                '```',
+                skipped,
+                '```',
+                '',
+                '请手工检查合并冲突或迁移编号。',
+              ].join('\n'),
+              labels: ['upstream-sync'],
+            });
+
+      - name: Push merged branch
+        if: steps.fetch.outputs.behind != '0' && success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet HEAD; then
+            echo "合并后无改动，跳过推送"
+          else
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      - name: Upload artifacts
+        if: steps.fetch.outputs.behind != '0' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vocat-linux-${{ github.run_number }}
+          path: dist/
+          retention-days: 30
