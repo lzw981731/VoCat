@@ -143,16 +143,31 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
+      - name: Resolve release version
+        id: ver
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          # 版本格式：<上游 tag>-custom.<run_number>，保证每次同步发布都递增
+          UPSTREAM_TAG=$(git describe --tags --abbrev=0 "upstream/${UPSTREAM_BRANCH}" 2>/dev/null || echo "v0.0.0")
+          BASE=${UPSTREAM_TAG#v}
+          VERSION="${BASE}-custom.${{ github.run_number }}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "发布版本: ${VERSION}（tag v${VERSION}）"
+
       - name: Build binaries
         id: build
         if: steps.fetch.outputs.behind != '0'
         run: |
           set -euo pipefail
           mkdir -p dist
+          BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X vocat/internal/buildinfo.Version=${{ steps.ver.outputs.version }} -X vocat/internal/buildinfo.BuildTime=${BUILD_TIME}"
           for target in "linux amd64" "linux arm64" "linux arm"; do
             set -- $target
             GOOS=$1 GOARCH=$2 CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w" -o "dist/vocat-$1-$2" ./cmd/vocat
+              go build -trimpath -ldflags "$LDFLAGS" -o "dist/vocat-$1-$2" ./cmd/vocat
           done
           ls -la dist/
 
@@ -193,6 +208,27 @@ jobs:
           else
             git push origin HEAD:${{ github.ref_name }}
           fi
+
+      - name: Publish release
+        if: steps.fetch.outputs.behind != '0' && success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: VoCat ${{ steps.ver.outputs.version }}
+          body: |
+            ## 自动同步构建
+
+            同步上游 `${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}`，并保留本地改动（保护清单 13 个文件）。
+
+            - 版本：`${{ steps.ver.outputs.version }}`
+            - 构建时间：${{ github.event.repository.updated_at }}
+            - 运行记录：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: |
+            dist/vocat-linux-amd64
+            dist/vocat-linux-arm64
+            dist/vocat-linux-arm
+          draft: false
+          prerelease: false
 
       - name: Upload artifacts
         if: steps.fetch.outputs.behind != '0' && success()
