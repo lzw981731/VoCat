@@ -371,6 +371,12 @@ func (s *Store) SMSMessage(ctx context.Context, id int64) (SMSMessage, error) {
 	return scanSMSMessage(s.db.QueryRowContext(ctx, smsMessageSelect+` WHERE id = ?`, id))
 }
 
+// SMSMessageByMessageID 按设备侧 message_id 查询短信。
+// 发送接口返回的是 ims-submit:/at-submit: 形式的字符串 ID，不是自增主键。
+func (s *Store) SMSMessageByMessageID(ctx context.Context, messageID string) (SMSMessage, error) {
+	return scanSMSMessage(s.db.QueryRowContext(ctx, smsMessageSelect+` WHERE message_id = ? ORDER BY id DESC LIMIT 1`, messageID))
+}
+
 // LatestSMSMessageID returns the current durable cursor used by notification
 // consumers. Starting at this value avoids replaying the entire SMS archive
 // whenever the service or a notification provider is restarted.

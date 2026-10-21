@@ -142,6 +142,8 @@ type AutomaticTask struct {
 	RetryCount   int             `json:"retry_count"`
 	Notify       bool            `json:"notify"`
 	RevertProfile bool           `json:"revert_profile"`
+	// 执行失败时先重连 VoWiFi 再重试（仅 vowifi 环境生效）
+	ReconnectVoWiFiOnFailure bool `json:"reconnect_vowifi_on_failure"`
 	NextRunAt    time.Time       `json:"next_run_at"`
 	LastRunAt    time.Time       `json:"last_run_at,omitempty"`
 	LastStatus   string          `json:"last_status"`

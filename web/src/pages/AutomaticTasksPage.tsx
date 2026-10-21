@@ -54,6 +54,7 @@ interface AutomaticTask {
   retryCount: number;
   notify: boolean;
   revertProfile?: boolean;
+  reconnectVowifiOnFailure?: boolean;
   nextRunAt: string;
   lastRunAt?: string;
   lastStatus: string;
@@ -88,6 +89,7 @@ interface TaskForm {
   retryCount: number;
   notify: boolean;
   revertProfile: boolean;
+  reconnectVowifiOnFailure: boolean;
   phone: string;
   message: string;
   durationSeconds: number;
@@ -126,6 +128,7 @@ function emptyForm(deviceId = ""): TaskForm {
     retryCount: 1,
     notify: true,
     revertProfile: true,
+    reconnectVowifiOnFailure: false,
     phone: "",
     message: "",
     durationSeconds: 30,
@@ -300,6 +303,7 @@ export default function AutomaticTasksPage() {
       retryCount: task.retryCount,
       notify: task.notify,
       revertProfile: task.revertProfile ?? true,
+      reconnectVowifiOnFailure: task.reconnectVowifiOnFailure ?? false,
       phone: task.payload?.phone || "",
       message: task.payload?.message || "",
       durationSeconds: task.payload?.durationSeconds || 30,
@@ -368,6 +372,7 @@ export default function AutomaticTasksPage() {
         retryCount: Number(form.retryCount),
         notify: form.notify,
         revertProfile: form.revertProfile,
+        reconnectVowifiOnFailure: form.reconnectVowifiOnFailure,
         payload: form.taskType === "cellular_attach" ? {} : {
           phone: form.phone,
           message: form.message,
@@ -556,6 +561,7 @@ export default function AutomaticTasksPage() {
           <div><label className={fieldLabel}>{t("任务失败重试次数")}</label><Select value={String(form.retryCount)} onChange={(value) => setForm({ ...form, retryCount: Number(value) })} options={Array.from({ length: 11 }, (_, count) => ({ value: String(count), label: t("{count} 次").replace("{count}", String(count)) }))} /></div>
           <div className="flex items-center justify-between rounded-lg border border-gray-200 p-3 dark:border-white/10"><div><div className="text-sm font-semibold">{t("启用任务")}</div><div className="text-xs text-gray-400">{t("停用后不会进入执行队列")}</div></div><Switch checked={form.enabled} onChange={(enabled) => setForm({ ...form, enabled })} /></div>
           <div className="flex items-center justify-between rounded-lg border border-gray-200 p-3 dark:border-white/10"><div><div className="text-sm font-semibold">{t("完成后推送通知")}</div><div className="text-xs text-gray-400">{t("发送到全部已配置并启用的通知渠道")}</div></div><Switch checked={form.notify} onChange={(notify) => setForm({ ...form, notify })} /></div>
+          {form.environment === "vowifi" ? <div className="md:col-span-2 flex items-center justify-between rounded-lg border border-gray-200 p-3 dark:border-white/10"><div><div className="text-sm font-semibold">{t("执行失败重连 VoWiFi")}</div><div className="text-xs text-gray-400">{t("每次执行失败后先重连 VoWiFi 重建 IMS 承载，再按重试次数继续；仅对 VoWiFi 环境生效")}</div></div><Switch checked={form.reconnectVowifiOnFailure} onChange={(reconnectVowifiOnFailure) => setForm({ ...form, reconnectVowifiOnFailure })} /></div> : null}
           <div className="md:col-span-2 flex items-center justify-between rounded-lg border border-gray-200 p-3 dark:border-white/10"><div><div className="text-sm font-semibold">{t("任务完成后切回原卡")}</div><div className="text-xs text-gray-400">{t("若执行前活跃卡与任务卡不同，任务完成后自动切回执行前的 SIM / Profile 并恢复其网络策略")}</div></div><Switch checked={form.revertProfile} onChange={(revertProfile) => setForm({ ...form, revertProfile })} /></div>
         </div>
         <div className="mt-5 flex justify-end gap-2"><Button onClick={closeEditor}>{t("取消")}</Button><Button variant="primary" loading={saving} onClick={() => void save()}>{t("保存")}</Button></div>

@@ -528,6 +528,13 @@ func migrationStatements(version int) []string {
 			)`,
 			`CREATE INDEX IF NOT EXISTS sms_raw_records_device_idx ON sms_raw_records(device_id, id DESC)`,
 		}
+	case 28:
+		return []string{
+			// 执行失败时是否先重连 VoWiFi 再重试（仅 vowifi 环境生效）
+			`ALTER TABLE automatic_tasks
+				ADD COLUMN reconnect_vowifi_on_failure INTEGER NOT NULL DEFAULT 0
+				CHECK (reconnect_vowifi_on_failure IN (0, 1))`,
+		}
 	default:
 		return nil
 	}

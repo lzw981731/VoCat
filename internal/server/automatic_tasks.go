@@ -159,6 +159,12 @@ func (scheduler *automaticTaskScheduler) execute(run store.AutomaticTaskRun) {
 		if errors.As(err, &executionError) && !executionError.retryable {
 			break
 		}
+		// 方案 A：每次失败后先重连 VoWiFi，再按 retry_count 重试。
+		// 仅对 vowifi 环境的任务生效，避免误动蜂窝环境下的模组状态。
+		if task.ReconnectVoWiFiOnFailure && task.Environment == "vowifi" {
+			progress("执行失败，正在重连 VoWiFi")
+			scheduler.server.reconnectVoWiFiForAutomaticTask(task, attempt)
+		}
 		if attempt <= task.RetryCount {
 			// A device error may contain the full AT command, including APN
 			// credentials. The persisted run retains a user-facing outcome; logs
@@ -183,6 +189,22 @@ func (scheduler *automaticTaskScheduler) execute(run store.AutomaticTaskRun) {
 	if task.Notify {
 		go scheduler.server.notifyAutomaticTask(context.Background(), task, run)
 	}
+}
+
+// reconnectVoWiFiForAutomaticTask 在自动任务失败后重建 VoWiFi 承载。
+// 方案 A：每次失败都先重连再重试，让 IMS 隧道与 IMS 注册回到可用状态，
+// 否则后续重试会在同一个坏掉的承载上继续失败。重连失败只记日志，不中断重试流程。
+func (s *Server) reconnectVoWiFiForAutomaticTask(task store.AutomaticTask, attempt int) {
+	if s.vowifi == nil {
+		s.logger.Warn("automatic task VoWiFi reconnect skipped", "task_id", task.ID, "reason", "vowifi runtime unavailable")
+		return
+	}
+	state, err := s.vowifi.RequestReconnect(task.DeviceID)
+	if err != nil {
+		s.logger.Warn("automatic task VoWiFi reconnect failed", "task_id", task.ID, "device_id", task.DeviceID, "attempt", attempt, "error", err)
+		return
+	}
+	s.logger.Info("automatic task requested VoWiFi reconnect", "task_id", task.ID, "device_id", task.DeviceID, "attempt", attempt, "phase", state.Phase)
 }
 
 func (s *Server) executeAutomaticTask(ctx context.Context, task store.AutomaticTask, progress automaticTaskProgress) (output string, err error) {
@@ -589,7 +611,70 @@ func (s *Server) executeAutomaticSMS(ctx context.Context, task store.AutomaticTa
 		// retry according to the configured count.
 		return "", automaticTaskExecutionError{err: failure, retryable: automaticSMSRetrySafe(recorder.Body.Bytes())}
 	}
-	return "短信已提交到 " + payload.Phone, nil
+
+	// VoWiFi 通道下「已被 IMS 受理」不等于送达：sipCode 202 只代表网络收下了请求，
+	// 必须等到 delivery-report 才能确认。基站直连没有可靠的送达回执通道，保持原判据。
+	if task.Environment != "vowifi" {
+		return "短信已提交到 " + payload.Phone, nil
+	}
+
+	var response struct {
+		Data struct {
+			MessageID         string `json:"message_id"`
+			DeliveryConfirmed bool   `json:"delivery_confirmed"`
+			DeliveryState     string `json:"delivery_state"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		// 解析失败时退回原语义，避免因响应变化把已提交的短信误判成失败
+		return "短信已提交到 " + payload.Phone, nil
+	}
+	if response.Data.DeliveryConfirmed {
+		return "短信已送达 " + payload.Phone, nil
+	}
+	return s.waitAutomaticSMSDelivery(ctx, task, payload.Phone, response.Data.MessageID)
+}
+
+// waitAutomaticSMSDelivery 轮询短信送达状态，直到收到 delivery-report 或超时。
+// 实测正常回执 2-5 秒返回，故超时设为 15 秒；超时按失败处理（用户要求「只有送达才算成功」），
+// 但标记为可重试，因为可能只是回执延迟而非发送失败。
+func (s *Server) waitAutomaticSMSDelivery(ctx context.Context, task store.AutomaticTask, phone, messageID string) (string, error) {
+	const (
+		pollInterval = 3 * time.Second
+		maxWait      = 15 * time.Second
+	)
+	if messageID == "" {
+		return "", automaticTaskExecutionError{
+			err:       fmt.Errorf("短信已提交到 %s，但未返回消息 ID，无法确认送达", phone),
+			retryable: true,
+		}
+	}
+	deadline := time.Now().Add(maxWait)
+	for {
+		message, err := s.store.SMSMessageByMessageID(ctx, messageID)
+		if err == nil {
+			switch strings.ToLower(message.DeliveryState) {
+			case "delivered":
+				return "短信已送达 " + phone, nil
+			case "failed", "expired", "rejected":
+				return "", automaticTaskExecutionError{
+					err:       fmt.Errorf("短信送达失败（%s）", message.DeliveryState),
+					retryable: false,
+				}
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return "", automaticTaskExecutionError{
+				err:       fmt.Errorf("短信已提交到 %s，但 %s 内未收到送达回执", phone, maxWait),
+				retryable: true,
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 func automaticSMSRetrySafe(body []byte) bool {
@@ -929,6 +1014,8 @@ func (s *Server) decodeAutomaticTask(r *http.Request, id int64) (store.Automatic
 		Notify             bool                 `json:"notify"`
 		RevertProfile      *bool                `json:"revert_profile"`
 		RevertProfileCamel *bool                `json:"revertProfile"`
+		ReconnectVoWiFi      *bool                `json:"reconnect_vowifi_on_failure"`
+		ReconnectVoWiFiCamel *bool                `json:"reconnectVowifiOnFailure"`
 		Payload            automaticTaskPayload `json:"payload"`
 	}
 	if err := s.decodeJSON(nilResponseWriter{}, r, &request); err != nil {
@@ -991,12 +1078,20 @@ func (s *Server) decodeAutomaticTask(r *http.Request, id int64) (store.Automatic
 	} else if request.RevertProfileCamel != nil {
 		revertProfile = *request.RevertProfileCamel
 	}
+	// 前端提交的是驼峰 reconnectVowifiOnFailure，兼容下划线写法
+	reconnectVoWiFi := false
+	if request.ReconnectVoWiFi != nil {
+		reconnectVoWiFi = *request.ReconnectVoWiFi
+	} else if request.ReconnectVoWiFiCamel != nil {
+		reconnectVoWiFi = *request.ReconnectVoWiFiCamel
+	}
 	payload, _ := json.Marshal(request.Payload)
 	task := store.AutomaticTask{ID: id, Name: request.Name, Enabled: request.Enabled, DeviceID: request.DeviceID,
 		ProfileICCID: request.ProfileICCID, ProfileAID: request.ProfileAID, TaskType: request.TaskType,
 		Environment: request.Environment, IntervalDays: request.IntervalDays, StartDate: request.StartDate,
 		RunTime: request.RunTime, Timezone: request.Timezone, Payload: payload, RetryCount: request.RetryCount,
-		Notify: request.Notify, RevertProfile: revertProfile, NextRunAt: nextRun.UTC()}
+		Notify: request.Notify, RevertProfile: revertProfile,
+		ReconnectVoWiFiOnFailure: reconnectVoWiFi, NextRunAt: nextRun.UTC()}
 	if id != 0 {
 		if previous, previousErr := s.store.AutomaticTask(r.Context(), id); previousErr == nil {
 			task.CreatedAt, task.LastRunAt, task.LastStatus, task.LastError = previous.CreatedAt, previous.LastRunAt, previous.LastStatus, previous.LastError
