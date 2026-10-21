@@ -169,7 +169,9 @@ jobs:
             GOOS=$1 GOARCH=$2 CGO_ENABLED=0 \
               go build -trimpath -ldflags "$LDFLAGS" -o "dist/vocat-$1-$2" ./cmd/vocat
           done
-          ls -la dist/
+          # 自更新要求 Release 带 SHA256SUMS（internal/update/update.go），缺了会拒绝安装
+          cd dist && sha256sum vocat-linux-* > SHA256SUMS && cat SHA256SUMS
+          cd .. && ls -la dist/
 
       - name: Create issue on build failure
         if: failure() && steps.fetch.outputs.behind != '0'
@@ -227,6 +229,7 @@ jobs:
             dist/vocat-linux-amd64
             dist/vocat-linux-arm64
             dist/vocat-linux-arm
+            dist/SHA256SUMS
           draft: false
           prerelease: false
 
